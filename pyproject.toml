@@ -1,0 +1,18 @@
+# Package the portable cache and its replay command.
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tiered-kv-cache"
+version = "0.1.0"
+description = "A bounded three-tier KV page cache reference"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+
+[project.scripts]
+kv-replay = "tiered_kv_cache.replay:main"
+kv-bench = "tiered_kv_cache.benchmark:main"
+
+[tool.setuptools.packages.find]
+include = ["tiered_kv_cache*"]
