@@ -1,21 +1,23 @@
-"""Manage immutable KV pages across two resident tiers and a disk tier."""
-from collections import Counter, OrderedDict
+"""Thread-safe Python views over the native page cache."""
 from contextlib import contextmanager
+import ctypes as c
 from dataclasses import dataclass
-import hashlib
+import os
 from pathlib import Path
 import sqlite3
 from tempfile import TemporaryDirectory
 from threading import RLock
 from uuid import UUID, uuid4
 
+from ._native import Stats, key, lib, ptr, size
+
 
 class CacheFull(RuntimeError):
-    """Indicate that admission requires a free page or an unpinned victim."""
+    """Indicate that admission needs a free slot or an unpinned victim."""
 
 
 class CorruptPage(OSError):
-    """Indicate a missing or damaged disk page."""
+    """Identify a missing or corrupt spill page."""
 
 
 @dataclass(frozen=True)
@@ -25,165 +27,128 @@ class PageHandle:
     allocation: int
 
 
+def _check(status):
+    """Map native status values to the public exception types."""
+    if status:
+        kind, message = {
+            1: (CacheFull, "all slots or GPU victims are unavailable"),
+            2: (CorruptPage, "disk page failed its checksum"),
+            3: (KeyError, "unknown allocation"),
+            4: (RuntimeError, "page is pinned"),
+            5: (sqlite3.DatabaseError, "SQLite page operation failed"),
+            6: (MemoryError, "cache allocation failed"),
+            7: (ValueError, "invalid cache argument"),
+        }[status]
+        raise kind(message)
+
+
 class PageCache:
-    """Provide synchronous, thread-safe access to fixed-size pages."""
+    """Serialize access to a native cache with bounded resident and disk tiers."""
 
     def __init__(self, directory, *, page_bytes, gpu_pages, ram_pages, disk_pages):
-        """Set page limits and create a private temporary spill directory."""
+        """Open a private SQLite spill database and allocate native state."""
         for value in (page_bytes, gpu_pages, ram_pages, disk_pages):
-            if type(value) is not int or value < 1:
+            if type(value) is not int or not 0 < value <= size(-1).value:
                 raise ValueError("page size and tier capacities must be positive integers")
-        self.page_bytes = page_bytes
-        self._gpu_limit = gpu_pages
-        self._ram_limit = ram_pages
-        self._limit = gpu_pages + ram_pages + disk_pages
         self._id = uuid4()
-        self._next = 0
-        self._gpu = OrderedDict()
-        self._ram = OrderedDict()
-        self._digests = {}
-        self._pins = Counter()
-        self._hits = Counter()
         self._lock = RLock()
+        self.page_bytes = page_bytes
         self._directory = TemporaryDirectory(dir=directory)
-        self._db = sqlite3.connect(Path(self._directory.name) / "pages.db",
-                                   check_same_thread=False)
-        self._db.execute("CREATE TABLE pages (id INTEGER PRIMARY KEY, data BLOB NOT NULL)")
-        self._closed = False
+        self._database_path = Path(self._directory.name) / "pages.db"
+        self._cache = ptr()
+        try:
+            _check(lib.kv_open(os.fsencode(self._database_path), page_bytes, gpu_pages,
+                               ram_pages, disk_pages, c.byref(self._cache)))
+        except BaseException:
+            self._directory.cleanup()
+            raise
 
-    def _require_open(self):
-        """Reject operations after cleanup."""
-        if self._closed:
+    def _open(self):
+        """Return the live native pointer."""
+        if not self._cache:
             raise RuntimeError("cache is closed")
+        return self._cache
 
-    def _locate(self, handle):
-        """Check ownership and return the source tier."""
-        self._require_open()
-        if handle.cache_id != self._id or handle.allocation not in self._digests:
+    def _id_for(self, handle):
+        """Reject handles issued by a different cache."""
+        self._open()
+        if not isinstance(handle, PageHandle) or handle.cache_id != self._id:
             raise KeyError(handle)
-        if handle.allocation in self._gpu:
-            return "gpu"
-        if handle.allocation in self._ram:
-            return "ram"
-        return "disk"
-
-    def _admit(self, key, payload, source):
-        """Plan evictions and commit disk changes before updating resident tiers."""
-        gpu_victim = None
-        ram_victim = None
-        if len(self._gpu) == self._gpu_limit:
-            gpu_victim = next((k for k in self._gpu if not self._pins[k]), None)
-            if gpu_victim is None:
-                raise CacheFull("all GPU pages are pinned")
-            if len(self._ram) == self._ram_limit and source != "ram":
-                ram_victim = next(iter(self._ram))
-        with self._db:
-            if source == "disk":
-                self._db.execute("DELETE FROM pages WHERE id = ?", (key,))
-            if ram_victim is not None:
-                self._db.execute("INSERT INTO pages VALUES (?, ?)",
-                                 (ram_victim, self._ram[ram_victim]))
-        if source == "ram":
-            del self._ram[key]
-        if ram_victim is not None:
-            del self._ram[ram_victim]
-        if gpu_victim is not None:
-            self._ram[gpu_victim] = self._gpu.pop(gpu_victim)
-        self._gpu[key] = payload
+        if not isinstance(handle.allocation, int) or not 0 <= handle.allocation < 2**63:
+            raise KeyError(handle)
+        return handle.allocation
 
     def put(self, payload):
-        """Allocate a fresh page in the GPU tier."""
+        """Copy immutable bytes into a new native allocation."""
         if not isinstance(payload, bytes) or len(payload) != self.page_bytes:
             raise ValueError("expected exactly one immutable page of bytes")
         with self._lock:
-            self._require_open()
-            if len(self._digests) == self._limit:
-                raise CacheFull("all page slots are allocated")
-            key = self._next
-            self._admit(key, payload, None)
-            self._digests[key] = hashlib.sha256(payload).digest()
-            self._next += 1
-            return PageHandle(self._id, key)
+            allocation = key()
+            _check(lib.kv_put(self._open(), payload, len(payload), c.byref(allocation)))
+            return PageHandle(self._id, allocation.value)
+
+    def _copy(self, handle, pinned):
+        """Read into an independent Python buffer while the cache lock is held."""
+        allocation = self._id_for(handle)
+        buf = c.create_string_buffer(self.page_bytes)
+        _check(lib.kv_read(self._cache, allocation, pinned, buf))
+        try:
+            return buf.raw
+        except BaseException:
+            if pinned:
+                _check(lib.kv_unpin(self._cache, allocation))
+            raise
 
     def read(self, handle):
-        """Restore a page to the GPU tier and return its bytes."""
+        """Restore a page and return its immutable bytes."""
         with self._lock:
-            source = self._locate(handle)
-            key = handle.allocation
-            if source == "gpu":
-                self._gpu.move_to_end(key)
-            else:
-                if source == "ram":
-                    payload = self._ram[key]
-                else:
-                    row = self._db.execute("SELECT data FROM pages WHERE id = ?", (key,)).fetchone()
-                    if row is None or hashlib.sha256(row[0]).digest() != self._digests[key]:
-                        raise CorruptPage(f"disk page {key} failed its checksum")
-                    payload = row[0]
-                self._admit(key, payload, source)
-            self._hits[source] += 1
-            return self._gpu[key]
+            return self._copy(handle, False)
 
     def prefetch(self, handle):
-        """Promote a page before its next use."""
-        self.read(handle)
+        """Promote the page without copying its payload into Python."""
+        with self._lock:
+            _check(lib.kv_read(self._open(), self._id_for(handle), False, None))
 
     @contextmanager
     def pin(self, handle):
-        """Keep a page in the GPU tier until the caller exits the context."""
+        """Prevent eviction and release until the caller leaves this context."""
         with self._lock:
-            payload = self.read(handle)
-            self._pins[handle.allocation] += 1
+            payload = self._copy(handle, True)
         try:
             yield payload
         finally:
             with self._lock:
-                self._pins[handle.allocation] -= 1
-                if not self._pins[handle.allocation]:
-                    del self._pins[handle.allocation]
+                _check(lib.kv_unpin(self._open(), self._id_for(handle)))
 
     def release(self, handle):
-        """Free an unpinned page and invalidate its handle."""
+        """Invalidate one unpinned allocation."""
         with self._lock:
-            source = self._locate(handle)
-            key = handle.allocation
-            if self._pins[key]:
-                raise RuntimeError("page is pinned")
-            if source == "disk":
-                with self._db:
-                    self._db.execute("DELETE FROM pages WHERE id = ?", (key,))
-            elif source == "ram":
-                del self._ram[key]
-            else:
-                del self._gpu[key]
-            del self._digests[key]
+            _check(lib.kv_release(self._open(), self._id_for(handle)))
 
     def stats(self):
-        """Return current page counts and successful accesses by source tier."""
+        """Return placement and source hit counts from one native snapshot."""
         with self._lock:
-            self._require_open()
-            return {"pages": {"gpu": len(self._gpu), "ram": len(self._ram),
-                              "disk": len(self._digests) - len(self._gpu) - len(self._ram)},
-                    "hits": {t: self._hits[t] for t in ("gpu", "ram", "disk")}}
+            counts = Stats()
+            lib.kv_stats(self._open(), c.byref(counts))
+            tiers = ("gpu", "ram", "disk")
+            return {"pages": dict(zip(tiers, counts.pages)), "hits": dict(zip(tiers, counts.hits))}
 
     def close(self):
-        """Remove all pages after callers release their pins."""
+        """Free native resources once all pins have been returned."""
         with self._lock:
-            if self._pins:
-                raise RuntimeError("cache has pinned pages")
-            if not self._closed:
-                self._db.close()
+            if self._cache:
+                _check(lib.kv_close(self._cache))
+                self._cache = ptr()
                 self._directory.cleanup()
-                self._gpu.clear()
-                self._ram.clear()
-                self._digests.clear()
-                self._closed = True
+
+    def __del__(self):
+        """Release abandoned instances after all pin contexts have expired."""
+        if getattr(self, "_cache", None):
+            self.close()
 
     def __enter__(self):
-        """Return the open cache."""
-        self._require_open()
+        self._open()
         return self
 
     def __exit__(self, *_):
-        """Release cache storage."""
         self.close()

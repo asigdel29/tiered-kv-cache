@@ -10,7 +10,16 @@ This library stores fixed-size, immutable KV pages in three bounded tiers. Use i
 
 ## Quickstart
 
-Use Python 3.10 or later. The reference implementation uses the Python standard library.
+Install Zig 0.16.0 and system SQLite development libraries. Linux and macOS are supported. The standalone commands have no Python dependency.
+
+```sh
+zig build -Doptimize=ReleaseSafe
+zig build test
+zig-out/bin/kv-cache replay --rounds 10
+zig-out/bin/kv-cache bench --output bench-results/cache.json
+```
+
+For the Python API and the original command names, install with `python3 -m pip install .`. The wheel includes both native products. A source build requires the same Zig compiler and system SQLite. Running an installed wheel requires the system SQLite library.
 
 1. Run `make check` to test the cache.
 2. Run `make demo` to replay three pages.
@@ -25,7 +34,7 @@ GPU tier (host bytes)  <-->  RAM tier (host bytes)  <-->  SQLite file
        pin / read             LRU demotion                 checksum on restore
 ```
 
-The GPU and RAM tiers simulate device and host storage with Python bytes. The disk tier uses a private SQLite database.
+The GPU and RAM tiers simulate device and host storage with Zig byte buffers. The disk tier uses a private SQLite database.
 Select an NVMe mount with `python3 -m tiered_kv_cache.replay --directory /path/to/mount`.
 The operating system can cache disk reads. Physical GPU transfer, pinned host allocation, and asynchronous device operations remain future work.
 
@@ -53,7 +62,7 @@ Use `stats()` to inspect occupancy and source-tier hits. The replay measures log
 
 ## Benchmarks and CI
 
-Run `make bench` to write `bench-results/cache.json`. Use the same seed, Python version, SQLite version, and storage device for repeat comparisons.
+Run `make bench` to write `bench-results/cache.json`. Use the same seed, Zig version, SQLite version, and storage device for repeat comparisons.
 
 ```sh
 make bench ARGS="--seed 42 --reads 256 --repeats 10 --page-bytes 4096 --output bench-results/cache.json"
@@ -70,7 +79,7 @@ The resident baseline holds all 16 pages in the first tier. The tiered configura
 Each trial warms a new cache with one trace pass. The measured pass times each read and verifies every byte after the timer stops.
 The report records raw latencies, hit counts, the trace, the payload digest, and host details.
 The comparison reports tiered minus resident mean read latency. Its 95% percentile bootstrap interval uses 2,000 resamples of paired trial means.
-Trials alternate execution order. These measurements include Python, SQLite, and operating system cache costs.
+Trials alternate execution order. The timer measures Zig cache access and SQLite operations. The native generator has its own seeded trace. Compare payload digests and trace arrays before comparing different releases.
 
 CI builds and installs the wheel on three Python versions. Tests run outside the checkout.
 The benchmark job uploads the JSON report to the workflow run for 30 days. Hosted runner load can affect timings.
@@ -90,4 +99,4 @@ make graph
 graphify query "PageCache"
 ```
 
-The build reads tracked Python files from the working tree, including tests. Stage new Python files before you refresh the map. Graphify uses local syntax analysis with model backends disabled. The system design diagrams describe runtime behavior.
+The build reads tracked Zig and Python files from the working tree, including tests. Stage new source files before you refresh the map. Graphify uses local syntax analysis with model backends disabled. The system design diagrams describe runtime behavior.

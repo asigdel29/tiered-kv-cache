@@ -1,6 +1,6 @@
 # Repository instructions
 
-This repository implements a synchronous, fixed-size page cache in Python. Start with the [system design](docs/system-design.md) and the [operating guide](docs/operations.md).
+This repository implements a synchronous, fixed-size page cache in Zig with a Python binding. Start with the [system design](docs/system-design.md) and the [operating guide](docs/operations.md).
 
 - Keep the public types and exceptions in `tiered_kv_cache/__init__.py` compatible with existing callers.
 - Keep handle validation, pin counts, tier placement, and hit accounting under the cache lock.

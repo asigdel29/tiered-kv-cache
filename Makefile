@@ -1,13 +1,16 @@
-# Run the reference tests and replay on the current host.
+# Build and verify Zig storage, commands, and Python bindings.
 PYTHON ?= python3
-.PHONY: check demo bench
-check:
+ZIG ?= zig
+.PHONY: build check demo bench graph
+build:
+	$(ZIG) build -Doptimize=ReleaseSafe
+check: build
+	$(ZIG) fmt --check build.zig src
+	$(ZIG) build test
 	$(PYTHON) -m unittest discover -s tests -v
-demo:
-	$(PYTHON) -m tiered_kv_cache.replay
-bench:
-	$(PYTHON) -m tiered_kv_cache.benchmark $(ARGS)
-
-.PHONY: graph
+demo: build
+	zig-out/bin/kv-cache replay $(ARGS)
+bench: build
+	zig-out/bin/kv-cache bench $(ARGS)
 graph:
 	bash scripts/graphify.sh
