@@ -50,17 +50,21 @@ class CacheTests(unittest.TestCase):
 
     def test_disk_transaction_rollback(self):
         a, b, c = (self.cache.put(x) for x in [b"a", b"b", b"c"])
-        self.cache._db.execute("CREATE TRIGGER fail BEFORE INSERT ON pages "
+        db = sqlite3.connect(self.cache._database_path)
+        self.addCleanup(db.close)
+        db.execute("CREATE TRIGGER fail BEFORE INSERT ON pages "
                                "BEGIN SELECT RAISE(ABORT, 'full disk'); END")
         with self.assertRaises(sqlite3.DatabaseError):
             self.cache.read(a)
-        self.cache._db.execute("DROP TRIGGER fail")
+        db.execute("DROP TRIGGER fail")
         self.assertEqual([self.cache.read(h) for h in [a, b, c]], [b"a", b"b", b"c"])
 
     def test_corrupt_page(self):
         a, _, c = (self.cache.put(x) for x in [b"a", b"b", b"c"])
-        with self.cache._db:
-            self.cache._db.execute("UPDATE pages SET data = ?", (b"x",))
+        db = sqlite3.connect(self.cache._database_path)
+        self.addCleanup(db.close)
+        with db:
+            db.execute("UPDATE pages SET data = ?", (b"x",))
         with self.assertRaises(CorruptPage):
             self.cache.read(a)
         self.assertEqual(self.cache.read(c), b"c")

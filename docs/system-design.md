@@ -7,10 +7,10 @@ A serving process can store immutable byte pages and keep a stable handle as eac
 | Component | Representation | Purpose |
 | --- | --- | --- |
 | Handle | Frozen cache UUID and allocation number | Reject foreign handles and released allocations. |
-| Allocation index | Allocation number to SHA-256 digest | Track live pages and verify bytes on disk restore. |
-| GPU and RAM tiers | Two ordered dictionaries of Python bytes | Model slot capacity and least-recently-used order. |
+| Allocation index | Zig hash map from allocation number to page metadata | Track live pages and verify bytes on disk restore. |
+| GPU and RAM tiers | Owned Zig buffers, tier tags, and monotonically increasing access stamps | Model slot capacity and least-recently-used order. |
 | Disk tier | SQLite table with an integer key and a BLOB | Store pages that leave RAM. |
-| Pin counts | Counter keyed by allocation number | Keep a page in the GPU tier across a caller's critical section. |
+| Pin counts | Pin count in each allocation record | Keep a page in the GPU tier across a caller's critical section. |
 
 The GPU and RAM tier names describe simulated placement. SQLite issues real filesystem operations through the operating system. Each cache creates its database in a private temporary directory.
 
@@ -29,17 +29,17 @@ classDiagram
         +stats() dict
         +close()
     }
-    class Connection {
+    class Store {
         +execute()
         +close()
     }
-    class OrderedDict {
-        +move_to_end()
-        +pop()
+    class NativeCache {
+        +admit()
+        +read()
     }
     PageCache ..> PageHandle : issues and validates
-    PageCache "1" *-- "1" Connection : disk
-    PageCache "1" *-- "2" OrderedDict : resident tiers
+    NativeCache "1" *-- "1" Store : disk
+    PageCache "1" *-- "1" NativeCache : C ABI
 ```
 
 ## Admission and promotion
@@ -70,14 +70,14 @@ sequenceDiagram
     end
 ```
 
-SQLite commits before the cache changes either resident dictionary. A missing row or a checksum failure raises `CorruptPage` before admission. Failed reads leave the hit counts unchanged.
+SQLite commits before the cache changes resident metadata. A missing row or a checksum failure raises `CorruptPage` before admission. Failed reads leave the hit counts unchanged.
 
 ## Concurrency and lifetime
 
-A reentrant lock serializes index updates, reads, and database writes within one process. Disk latency can delay calls on unrelated pages. A pin first reads the page and increments its count under the same lock. The caller then uses the bytes outside the lock. Exiting the pin context decrements the count, including when caller code raises an exception.
+Python calls acquire a reentrant lock, which serializes index updates, reads, and database writes within one process. Disk latency can delay calls on unrelated pages. A pin first reads the page and increments its count under the same lock. The caller then uses the bytes outside the lock. Exiting the pin context decrements the count, including when caller code raises an exception.
 
 A live handle identifies one allocation even when a different page has identical bytes. Release removes the page and its digest. A fresh allocation uses a new number. Close requires all pins to end and removes the temporary database. Process restart requires a new cache and new handles.
 
-The slot limits bound payload counts. Caller references can retain returned bytes after release. Python metadata, SQLite pages, and transaction journals add storage costs.
+The slot limits bound payload counts. Caller references can retain returned bytes after release. The native hash map, SQLite pages, and transaction journals add storage costs.
 
-The [implementation](../tiered_kv_cache/cache.py) defines the API. The [cache tests](../tests/test_cache.py) exercise transaction rollback, corruption, concurrent reads, capacity, and pin lifetime.
+The [native core](../src/cache.zig) owns every placement transition. The native caller serializes access or uses a single owner. The [Python binding](../tiered_kv_cache/cache.py) validates cache identifiers and copies read buffers before it releases its lock. Victim selection scans the index for the oldest eligible page. The [cache tests](../tests/test_cache.py) exercise transaction rollback, corruption, concurrent reads, capacity, and pin lifetime.

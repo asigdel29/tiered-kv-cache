@@ -2,11 +2,11 @@
 
 ## Run a placement check
 
-Use Python 3.10 or later from the repository root. Run the replay on the storage volume that will hold the scratch database.
+Build the native executable with Zig 0.16.0 from the repository root. Run the replay on the storage volume that will hold the scratch database.
 
 ```sh
 mkdir -p /tmp/kv-cache-replay
-python3 -m tiered_kv_cache.replay --directory /tmp/kv-cache-replay --rounds 1
+zig-out/bin/kv-cache replay --directory /tmp/kv-cache-replay --rounds 1
 ```
 
 The replay allocates three 4,096-byte pages. Each tier holds one page. The trace reads pages in order 2, 1, 0, 2, 1, 0. Check the JSON for six verified reads. Source hit counts should equal one GPU, one RAM, and four disk accesses. The cache removes its private directory on close.
@@ -34,7 +34,7 @@ Each configuration reads the same seeded payloads and trace. A resident trial al
 | --- | --- |
 | `workloads.scan.trace` | Logical page indices in request order. |
 | `workloads.scan.trials[0].tiered.hits` | Source hit counts for the measured pass. Their sum equals the number of reads. |
-| `workloads.scan.trials[0].tiered.read_ns` | Individual call durations in nanoseconds. These include lock acquisition, promotion, and any SQLite operation. |
+| `workloads.scan.trials[0].tiered.read_ns` | Individual call durations in nanoseconds. These include native page lookup, promotion, and SQLite operations. Python binding overhead is outside the measured interval. |
 | `workloads.scan.tiered_minus_resident.mean_ns` | Mean paired latency difference. A positive value indicates extra time per tiered read. |
 | `workloads.scan.tiered_minus_resident.ci95_ns` | Percentile bootstrap interval based on 2,000 resamples of paired trial means. |
 
