@@ -1,44 +1,62 @@
 # Tiered KV cache
 
-This library stores fixed-size, immutable KV pages in three bounded tiers. Use it to test admission, eviction, and page recovery.
+[![CI](https://github.com/asigdel29/tiered-kv-cache/actions/workflows/ci.yml/badge.svg)](https://github.com/asigdel29/tiered-kv-cache/actions/workflows/ci.yml)
+[![Apache License 2.0](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
-## Documentation
+Store immutable key/value cache pages under a fixed slot budget. Use the Zig executable to replay a trace or the Python API to manage pages by handle.
 
-- [System design and UML diagrams](docs/system-design.md)
-- [Operations, benchmark fields, and troubleshooting](docs/operations.md)
-- [Repository instructions](AGENTS.md)
+## Contents
 
-## Quickstart
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Requirements and quick start](#requirements-and-quick-start)
+- [Usage](#usage)
+- [Configuration](#configuration)
+- [Tests and benchmarks](#tests-and-benchmarks)
+- [Project structure](#project-structure)
+- [Documentation](#documentation)
+- [Contributing](#contributing)
+- [License](#license)
 
-Install Zig 0.16.0 and system SQLite development libraries. Linux and macOS are supported. The standalone commands have no Python dependency.
+## Overview
 
-```sh
-zig build -Doptimize=ReleaseSafe
-zig build test
-zig-out/bin/kv-cache replay --rounds 10
-zig-out/bin/kv-cache bench --output bench-results/cache.json
-```
+Use this cache to study page placement, pinning, and spill costs. The GPU and RAM tiers both use Zig buffers in host memory. SQLite stores the disk tier on the selected filesystem. The OS can cache disk reads. Physical GPU transfers and pinned host allocations remain future work.
 
-For the Python API and the original command names, install with `python3 -m pip install .`. The wheel includes both native products. A source build requires the same Zig compiler and system SQLite. Running an installed wheel requires the system SQLite library.
-
-1. Run `make check` to test the cache.
-2. Run `make demo` to replay three pages.
-3. Run `make bench` to write the benchmark report.
-
-The demo reports one GPU hit, one RAM hit, and four disk hits. It checks each returned byte.
+A page keeps the same handle when it moves between tiers. The cache checks the SHA-256 digest when it restores a disk page. Release the handle after its last consumer finishes.
 
 ## Architecture
 
-```text
-GPU tier (host bytes)  <-->  RAM tier (host bytes)  <-->  SQLite file
-       pin / read             LRU demotion                 checksum on restore
+```mermaid
+flowchart LR
+    Python[Python caller] --> Binding[PageCache and lock]
+    Binding --> ABI[C ABI]
+    ABI --> Cache[Zig cache]
+    CLI[Replay or benchmark CLI] --> Cache
+    Cache --> GPU[GPU tier in host RAM]
+    GPU <-->|Promote or demote| RAM[RAM tier]
+    RAM -->|Spill victim| DB[(SQLite scratch file)]
+    DB -->|Verify and restore| GPU
 ```
 
-The GPU and RAM tiers simulate device and host storage with Zig byte buffers. The disk tier uses a private SQLite database.
-Select an NVMe mount with `python3 -m tiered_kv_cache.replay --directory /path/to/mount`.
-The operating system can cache disk reads. Physical GPU transfer, pinned host allocation, and asynchronous device operations remain future work.
+| Component | Responsibility |
+| --- | --- |
+| Python binding | Validate handle ownership, serialize calls, and return independent byte strings. |
+| Native cache | Track allocations, pin counts, occupancy, access order, and page digests. |
+| SQLite store | Read and write page rows. Commit disk changes before resident placement changes. |
+| Native CLI | Replay seeded workloads, verify restored bytes, and report timings. |
 
-## Use the API
+## Requirements and quick start
+
+Use Linux or macOS with Zig 0.16.0 and the SQLite development library. Run these commands from a checkout.
+
+```sh
+make build
+zig-out/bin/kv-cache replay --rounds 1
+```
+
+Expect six verified reads, with one GPU hit, one RAM hit, and four disk hits. Install the wheel for Python access using the [runbook](docs/runbook.md).
+
+## Usage
 
 ```python
 from tiered_kv_cache import PageCache
@@ -51,52 +69,57 @@ with PageCache(None, page_bytes=4, gpu_pages=1, ram_pages=1, disk_pages=1) as ca
     cache.release(handle)
 ```
 
-Pass an existing scratch directory or use `None` for the system temporary directory. Each cache owns its database until close.
-Successful reads promote the page to the GPU tier. A pin prevents eviction and release.
-Admission raises `CacheFull` when all GPU pages have pins or all slots hold allocated pages.
-Release the page when its request ends. Old handles cannot access new allocations.
+A pin keeps the page in the GPU tier until the context exits. A synchronous prefetch also promotes a page. Both operations count a source hit.
 
-The limits count payload slots. SQLite metadata, transaction journals, temporary copies, and caller-owned bytes use extra space.
-A lock serializes cache operations. A failed disk transaction preserves the previous page layout.
-Use `stats()` to inspect occupancy and source-tier hits. The replay measures logical transfers.
+## Configuration
 
-## Benchmarks and CI
-
-Run `make bench` to write `bench-results/cache.json`. Use the same seed, Zig version, SQLite version, and storage device for repeat comparisons.
-
-```sh
-make bench ARGS="--seed 42 --reads 256 --repeats 10 --page-bytes 4096 --output bench-results/cache.json"
-```
-
-The resident baseline holds all 16 pages in the first tier. The tiered configuration uses four GPU slots, four RAM slots, and eight disk slots.
-
-| Workload | Page access pattern |
+| Setting | Meaning |
 | --- | --- |
-| Hot | Cycle through the four most recent pages. |
-| Scan | Visit all 16 pages in allocation order. |
-| Mixed | Choose a hot page with probability 0.8. Choose other pages for the remaining accesses. |
+| `page_bytes` | Exact byte count of each immutable payload. |
+| `gpu_pages`, `ram_pages`, `disk_pages` | Positive slot limits for the three tiers. |
+| Python `directory` | Existing scratch directory. Use `None` to select the system temporary directory. |
+| CLI `--directory` | Existing scratch directory for SQLite. The native default is `/tmp`. |
+| CLI `--output` | Benchmark JSON path. The default is `bench-results/cache.json`. |
 
-Each trial warms a new cache with one trace pass. The measured pass times each read and verifies every byte after the timer stops.
-The report records raw latencies, hit counts, the trace, the payload digest, and host details.
-The comparison reports tiered minus resident mean read latency. Its 95% percentile bootstrap interval uses 2,000 resamples of paired trial means.
-Trials alternate execution order. The timer measures Zig cache access and SQLite operations. The native generator has its own seeded trace. Compare payload digests and trace arrays before comparing different releases.
+The budget bounds the number of pages. Index entries, caller copies, and SQLite journals consume additional space.
 
-CI builds and installs the wheel on three Python versions. Tests run outside the checkout.
-The benchmark job uploads the JSON report to the workflow run for 30 days. Hosted runner load can affect timings.
+## Tests and benchmarks
+
+| Command | Result |
+| --- | --- |
+| `make check` | Checks Zig format, runs native tests, and exercises the Python API. |
+| `make demo ARGS="--rounds 100"` | Runs the placement trace and verifies 600 reads. |
+| `make bench` | Writes raw samples, traces, source hits, and paired latency intervals for three workloads. |
+
+CI tests installed wheels on Python 3.10, 3.12, and 3.14. The benchmark job retains its JSON artifact for 30 days. See the [measured test results](docs/test-log.md).
+
+## Project structure
+
+| Path | Contents |
+| --- | --- |
+| [src](src) | Zig cache core, SQLite interface, C ABI, and CLI. |
+| [tiered_kv_cache](tiered_kv_cache) | Python handles, binding, and command entry points. |
+| [tests](tests) | API, recovery, capacity, and workload checks. |
+| [docs](docs) | System design, runbook, and test log. |
+
+## Documentation
+
+| Guide | Use it to |
+| --- | --- |
+| [System design](docs/system-design.md) | Locate each component and its owner. |
+| [Page placement](docs/design/placement.md) | Trace promotion, eviction, commit, and rollback. |
+| [Handle ownership](docs/design/handles.md) | Check lifetimes, pin counts, and thread ownership. |
+| [Measurement design](docs/design/measurement.md) | Read the report fields and the 95% interval. |
+| [Runbook](docs/runbook.md) | Build, install, measure, and troubleshoot. |
+| [Test log](docs/test-log.md) | Inspect the tested revision, environment, and results. |
+| [Graphify report](graphify-out/GRAPH_REPORT.md) | Locate source relationships in the [JSON graph](graphify-out/graph.json) or [interactive map](graphify-out/graph.html). |
+
+## Contributing
+
+Read the [repository instructions](AGENTS.md) before changing the page API. Run `make check` and include the affected replay or benchmark in the pull request.
+
+To refresh the source map, install Graphify with `uv tool install graphifyy==0.9.76`. Stage new Zig and Python files, run `make graph`, then run `graphify query "PageCache"`.
 
 ## License
 
-The source and tests use the Apache License 2.0.
-
-## Graphify source map
-
-Read the [source map report](graphify-out/GRAPH_REPORT.md) or query the [graph data](graphify-out/graph.json). Open the [interactive map](graphify-out/graph.html) locally in a browser.
-
-Install Graphify 0.9.76 with `uv tool install graphifyy==0.9.76`. Run these commands from the repository root.
-
-```sh
-make graph
-graphify query "PageCache"
-```
-
-The build reads tracked Zig and Python files from the working tree, including tests. Stage new source files before you refresh the map. Graphify uses local syntax analysis with model backends disabled. The system design diagrams describe runtime behavior.
+The source and tests use the [Apache License 2.0](LICENSE).
